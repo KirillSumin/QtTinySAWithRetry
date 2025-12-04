@@ -22,69 +22,6 @@ TinySA, TinySA Ultra and the tinysa icon are trademarks of Erik Kaashoek and are
 TinySA commands are based on Erik's Python examples: http://athome.kaashoek.com/tinySA/python/
 Serial communication commands are based on Martin's Python NanoVNA/TinySA Toolset: https://github.com/Ho-Ro"""
 
-import time
-from serial.serialutil import SerialException
-from serial.tools import list_ports
-
-
-def _candidate_ports(self):
-    # 1) prefer current configured port first (if you have it)
-    p = getattr(self, "serialPort", None) or getattr(self, "port", None)
-    if p:
-        yield p
-
-    # 2) stable symlinks first (best on Linux)
-    for dev in sorted(glob.glob("/dev/serial/by-id/*")):
-        yield dev
-
-    # 3) pyserial scan
-    for info in list_ports.comports():
-        yield info.device
-
-    # 4) fallback
-    for dev in sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*")):
-        yield dev
-
-
-def _close_serial(self):
-    try:
-        if getattr(self, "usb", None):
-            self.usb.close()
-    except Exception:
-        pass
-    self.usb = None
-
-
-def _reconnect_serial_loop(self, stop_flag_attr="stopMeasurement"):
-    # Runs in measurement thread; won’t block the UI thread
-    backoff = 0.5
-    while True:
-        # stop condition (adapt to your codebase)
-        if getattr(self, stop_flag_attr, False):
-            return False
-
-        for dev in self._candidate_ports():
-            try:
-                # adapt baud/timeout to whatever QtTinySA already uses
-                s = serial.Serial(dev, baudrate=115200, timeout=1, write_timeout=1)
-                s.reset_input_buffer()
-                s.reset_output_buffer()
-                self.usb = s
-                # keep the chosen device so the next reconnect tries it first
-                if hasattr(self, "serialPort"):
-                    self.serialPort = dev
-                return True
-            except Exception:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-
-        time.sleep(backoff)
-        backoff = min(5.0, backoff * 1.5)
-
-
-
 import os
 import sys
 import time
@@ -159,6 +96,7 @@ class Analyser:
         self.signals.saveResults.connect(saveFile)
         self.signals.resetGUI.connect(self.resetGUI)
         self.signals.sweepEnds.connect(self.sweepComplete)
+        self.signals.error.connect(self.onSerialError)
         self.runTimer = QtCore.QElapsedTimer()
         self.scale = 174
         self.scanMemory = 50
@@ -166,6 +104,34 @@ class Analyser:
         self.maxF = 6000
         self.memF = BytesIO()
         self.ports = []
+    
+    def onSerialError(self, msg: str):
+        logging.info(msg)
+
+        # Stop scanning UI state
+        self.sweeping = False
+        self.threadRunning = False
+        try:
+            self.runButton('Run')
+        except Exception:
+            pass
+
+        # Close the broken port and restart hotplug detection
+        try:
+            self.closePort()
+        except Exception:
+            pass
+        self.ports = []
+        try:
+            usbCheck.start(500)   # resume VID/PID scanning
+        except Exception:
+            pass
+
+        # Optional: show a non-fatal hint somewhere in the UI
+        try:
+            QtTSA.version.setText("Disconnected (waiting for TinySA)")
+        except Exception:
+            pass
 
     def openPort(self):  # called by isConnected() triggered by the self.usbCheck QTimer at startup
         # Get tinySA comport using hardware ID
@@ -345,17 +311,37 @@ class Analyser:
             self.serialWrite(command)
 
     def serialQuery(self, command):
-        self.usb.write(command.encode())
-        self.usb.read_until(command.encode() + b'\n')  # skip command echo
-        response = self.usb.read_until(b'ch> ')  # until prompt
-        logging.debug(f'serialQuery: response = {response}')
-        return response[:-6].decode()  # remove prompt
+        if not self.usb:
+            return ""
+        try:
+            self.usb.write(command.encode())
+            self.usb.read_until(command.encode() + b'\n')
+            response = self.usb.read_until(b'ch> ')
+            return response[:-6].decode()
+        except serial.SerialException as e:
+            self.signals.error.emit(f"Serial query failed: {e}")
+            self.closePort()
+            self.ports = []
+            try:
+                usbCheck.start(500)
+            except Exception:
+                pass
+            return ""
 
     def serialWrite(self, command):
-        # self.usb.timeout = 1
-        logging.debug(f'serialWrite: command = {command}')
-        self.usb.write(command.encode())
-        self.usb.read_until(b'ch> ')  # skip command echo and prompt
+        if not self.usb:
+            return
+        try:
+            self.usb.write(command.encode())
+            self.usb.read_until(b'ch> ')
+        except serial.SerialException as e:
+            self.signals.error.emit(f"Serial write failed: {e}")
+            self.closePort()
+            self.ports = []
+            try:
+                usbCheck.start(500)
+            except Exception:
+                pass # skip command echo and prompt
 
     def set_arrays(self):
         startF = QtTSA.start_freq.value() * 1e6  # freq in Hz
@@ -506,22 +492,17 @@ class Analyser:
             # read the measurement data from the tinySA
             for point in range(points):
                 try:
-                    dataBlock = self.usb.read(3)
-                    if len(dataBlock) != 3:
-                        raise SerialException(f"short read: {len(dataBlock)} bytes")
-                except (SerialException, OSError) as e:
-                    print(f"[serial] disconnected: {e}")
-                    self._close_serial()
+                    dataBlock = self.usb.read(3)  # read a block of 3 bytes of data
+                except serial.SerialException as e:
+                    self.signals.error.emit(f"Serial read failed: {e}")
+                    self.sweeping = False
+                    break
 
-                    # optional: tell the GUI you’re disconnected (status bar / label)
-                    # e.g. self.statusBar().showMessage("tinySA disconnected - retrying...")
-
-                    ok = self._reconnect_serial_loop()
-                    if not ok:
-                        return  # or break out cleanly
-
-                    print("[serial] reconnected")
-                    continue  # read a block of 3 bytes of data
+                # If we didn't get exactly 3 bytes, treat as lost sync / disconnect
+                if not dataBlock or len(dataBlock) != 3:
+                    self.signals.error.emit(f"Serial short read (got {len(dataBlock) if dataBlock else 0} bytes)")
+                    self.sweeping = False
+                    break
 
                 logging.debug(f'dataBlock: {dataBlock}\n')
                 if dataBlock == b'}':  # from FW165 jog button press returns different value
@@ -576,15 +557,24 @@ class Analyser:
                     self.signals.result.emit(frequencies, readings, maxima, minima, timeElapsed)  # send to updateGUI()
                     updateTimer.start()
 
-        self.usb.read(2)  # discard the command prompt that the timySA sends when sweeping ends
+        try:
+            if self.usb:
+                self.usb.read(2)
+        except serial.SerialException:
+            pass  # discard the command prompt that the timySA sends when sweeping ends
         self.threadRunning = False
         self.signals.finished.emit()
 
     def threadEnds(self):
-        if int(self.firmware[2]) >= 177:  # the firmware version number
-            self.serialWrite('abort\r')
+        try:
+            if self.usb and int(self.firmware[2]) >= 177:
+                self.serialWrite('abort\r')
+        except serial.SerialException:
+            # Device is gone; ignore
+            pass
+
         self.runButton('Run')
-        self.fifoTimer.start(500)  # start watching for commands
+        self.fifoTimer.start(500) # start watching for commands
 
     def createTimeSpectrum(self, frequencies, readings):
         points = np.size(frequencies)
