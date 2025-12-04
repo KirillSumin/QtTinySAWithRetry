@@ -524,11 +524,10 @@ class Analyser:
 
             readings[0, :] = (data.astype(np.float32) / 32.0) - self.scale
 
-            # read the measurement data from the tinySA
-            readingsMax = np.nanmax(readings[:self.scanMemory], axis=0)
-            readingsMin = np.nanmin(readings[:self.scanMemory], axis=0)
-            maxima = np.fmax(maxima, readingsMax)
-            minima = np.fmin(minima, readingsMin)
+            # update running max/min from the current sweep only (cheap)
+            cur = readings[0]
+            maxima = np.maximum(maxima, cur)
+            minima = np.minimum(minima, cur)
 
             readings[-1] = readings[0]
             readings = np.roll(readings, 1, axis=0)
@@ -550,7 +549,29 @@ class Analyser:
                 self.signals.saveResults.emit(frequencies, readings)
                 sweepCount = 0
 
-            self.signals.sweepEnds.emit(frequencies)
+            # apply queued setting changes between sweeps
+            if (not self.fifo.empty()) or (not self.sweeping):
+                self.serialWrite('abort\r')
+                self.clearBuffer()
+                firstRun = True
+                self.setRBW()
+                frequencies, readings, maxima, minima = self.set_arrays()
+                points = np.size(frequencies)
+                self.signals.resetGUI.emit(frequencies, readings)
+                self.usbSend()
+                updateTimer.start()
+                continue  # start next sweep with new settings
+
+            # send GUI+marker updates on a timer (NOT every sweep)
+            timeElapsed = updateTimer.nsecsElapsed()
+
+            # clamp interval so 0ms doesn't melt the CPU
+            interval_ms = max(50, int(settings.intervalBox.value()))
+
+            if (timeElapsed / 1e6) > interval_ms:
+                self.signals.result.emit(frequencies, readings, maxima, minima, timeElapsed)
+                self.signals.sweepEnds.emit(frequencies)   # moved here
+                updateTimer.start()
 
             # apply queued setting changes between sweeps
             if (not self.fifo.empty()) or (not self.sweeping):
@@ -677,7 +698,7 @@ class Analyser:
         # for LNB/Mixer mode when LO is above measured freq the scan is reversed, i.e. low TinySA freq = high meas freq
         if bandstype.freq > frequencies[0]:
             frequencies = frequencies[::-1]  # reverse the array
-            np.fliplr(readings)
+            readings = np.fliplr(readings)
             QtTSA.waterfall.invertX(True)
         else:
             QtTSA.waterfall.invertX(False)
@@ -1173,11 +1194,11 @@ class Marker:
             logging.debug(f'updateMarker(): maxmin = {maxmin}')
             if self.markerType == 'Max':
                 self.line.setValue(maxmin[0][self.level])
-                if self.deltaline.value != 0:
+                if self.deltaline.value() != 0:
                     self.deltaline.setValue(maxmin[0][self.level] + self.deltaF)  # needs to be index delta not F
             if self.markerType == 'Min':
                 self.line.setValue(maxmin[1][self.level])
-                if self.deltaline.value != 0:
+                if self.deltaline.value() != 0:
                     self.deltaline.setValue(maxmin[1][self.level] + self.deltaF)  # needs to be index delta not F
 
         lineIndex = np.argmin(np.abs(frequencies - (self.line.value())))  # find closest value in freq array
