@@ -236,7 +236,7 @@ class Analyser:
         # call self.usbSend() every 200mS to send commands & update markers if not scanning
         self.fifoTimer = QtCore.QTimer()
         self.fifoTimer.timeout.connect(self.timerTasks)
-        self.fifoTimer.start(200)
+        self.fifoTimer.start(500)
 
     def setForDevice(self, product):
         # product = 'tinySA'  # used for testing
@@ -525,65 +525,51 @@ class Analyser:
             readings[0, :] = (data.astype(np.float32) / 32.0) - self.scale
 
             # read the measurement data from the tinySA
-            for point in range(points):
-                # If it's the final point of this sweep, set up for the next sweep
-                if point == points - 1:
-                    readingsMax = np.nanmax(readings[:self.scanMemory], axis=0)
-                    readingsMin = np.nanmin(readings[:self.scanMemory], axis=0)
-                    maxima = np.fmax(maxima, readingsMax)
-                    minima = np.fmin(minima, readingsMin)
+            readingsMax = np.nanmax(readings[:self.scanMemory], axis=0)
+            readingsMin = np.nanmin(readings[:self.scanMemory], axis=0)
+            maxima = np.fmax(maxima, readingsMax)
+            minima = np.fmin(minima, readingsMin)
 
-                    readings[-1] = readings[0]
-                    readings = np.roll(readings, 1, axis=0)
+            readings[-1] = readings[0]
+            readings = np.roll(readings, 1, axis=0)
 
-                    if version >= 177:
-                        try:
-                            tail = self.usb.read(2)   # expect b'}{'
-                        except serial.SerialException as e:
-                            self.signals.error.emit(f"Serial read failed at end-of-sweep: {e}")
-                            self.sweeping = False
-                            break
-
-                        # Handle timeout/short read explicitly
-                        if not tail or len(tail) != 2:
-                            self.signals.error.emit(
-                                f"Serial short read at end-of-sweep ({len(tail) if tail else 0}/2 bytes) - disconnected?"
-                            )
-                            self.sweeping = False
-                            break
-
-                        if tail != b'}{':
-                            logging.info(f"Out of sync tail={tail!r} (expected b'}}{{')")
-                            self.sweeping = False
-                            break
-
-                        sweepCount += 1
-                        firstRun = False
-                        if sweepCount == self.scanMemory:
-                            self.signals.saveResults.emit(frequencies, readings)
-                            sweepCount = 0
-
-                    self.signals.sweepEnds.emit(frequencies)
-
-                # If a sweep setting has been changed by the user, the sweep must be re-started (+ new recording start)
-                if self.fifo.qsize() > 0 or not self.sweeping:
-                    self.serialWrite('abort\r')
-                    self.clearBuffer()
-                    firstRun = True
-                    self.setRBW()  # reads GUI rbw box value
-                    frequencies, readings, maxima, minima = self.set_arrays()  # reads GUI values
-                    points = np.size(frequencies)
-                    self.signals.resetGUI.emit(frequencies, readings)
-                    self.usbSend()  # send all the queued commands in the FIFO buffer to the TinySA
-                    updateTimer.start()
+            if version >= 177:
+                tail = self.usb.read(2)  # expect b'}{'
+                if not tail or len(tail) != 2:
+                    self.signals.error.emit(f"Serial short read at end-of-sweep ({len(tail) if tail else 0}/2)")
+                    self.sweeping = False
+                    break
+                if tail != b'}{':
+                    logging.info(f"Out of sync tail={tail!r} (expected b'}}{{')")
+                    self.sweeping = False
                     break
 
-                timeElapsed = updateTimer.nsecsElapsed()  # how long this batch of measurements has been running, nS
+            sweepCount += 1
+            firstRun = False
+            if sweepCount == self.scanMemory:
+                self.signals.saveResults.emit(frequencies, readings)
+                sweepCount = 0
 
-                # Send the sesults to updateGUI if an update is due
-                if timeElapsed/1e6 > settings.intervalBox.value():
-                    self.signals.result.emit(frequencies, readings, maxima, minima, timeElapsed)  # send to updateGUI()
-                    updateTimer.start()
+            self.signals.sweepEnds.emit(frequencies)
+
+            # apply queued setting changes between sweeps
+            if (not self.fifo.empty()) or (not self.sweeping):
+                self.serialWrite('abort\r')
+                self.clearBuffer()
+                firstRun = True
+                self.setRBW()
+                frequencies, readings, maxima, minima = self.set_arrays()
+                points = np.size(frequencies)
+                self.signals.resetGUI.emit(frequencies, readings)
+                self.usbSend()
+                updateTimer.start()
+                continue  # start next sweep with new settings
+
+            # send GUI updates on a timer
+            timeElapsed = updateTimer.nsecsElapsed()
+            if timeElapsed / 1e6 > settings.intervalBox.value():
+                self.signals.result.emit(frequencies, readings, maxima, minima, timeElapsed)
+                updateTimer.start()
 
         try:
             if self.usb:
