@@ -155,19 +155,24 @@ class Analyser:
 
     def testPort(self, port):  # tests comms and initialises tinySA if found
         try:
-            self.usb = serial.Serial(port.device, baudrate=576000)
+            self.usb = serial.Serial(
+                port.device,
+                baudrate=576000,
+                timeout=0.25,        # <- critical
+                write_timeout=0.25   # <- nice to have
+            )
             logging.info(f'Serial port {port.device} open: {self.usb.isOpen()}')
         except serial.SerialException:
             logging.info('Serial port exception. A possible cause is that your username is not in the "dialout" group.')
             popUp(QtTSA, 'Serial port exception', 'Ok', 'Critical')
         if self.usb:
             for i in range(4):  # try 4 times to communicate with tinySA over USB serial
-                firmware = self.version()
-                if firmware[:6] == 'tinySA':
-                    logging.info(f'{port.device} test {i} : {firmware[:16]}')
-                    break
-                else:
-                    time.sleep(1)
+                firmware = ""
+                for i in range(4):
+                    firmware = self.version()
+                    if firmware.startswith("tinySA"):
+                        break
+                    QtCore.QCoreApplication.processEvents()  # keep UI responsive
             # split firmware into a list of [device, major version number, minor version number, other stuff]
             self.firmware = firmware.replace('_', '-').split('-')
             if firmware[:6] == 'tinySA':
@@ -298,27 +303,40 @@ class Analyser:
         threadpool.start(self.sweep)
 
     def timerTasks(self):
-        if self.usb:
+        # never do blocking serial traffic while measurement thread is active
+        if self.usb and not self.threadRunning:
             self.usbSend()
-        M1.updateMarker()
-        M2.updateMarker()
-        M3.updateMarker()
-        M4.updateMarker()
+
+            # marker updates are also heavy; keep them idle-only
+            M1.updateMarker()
+            M2.updateMarker()
+            M3.updateMarker()
+            M4.updateMarker()
 
     def usbSend(self):
-        while self.fifo.qsize() > 0:
-            command = self.fifo.get(block=True, timeout=None)
+        # SimpleQueue: no blocking + no timeouts here
+        while not self.fifo.empty():
+            command = self.fifo.get()
             self.serialWrite(command)
 
-    def serialQuery(self, command):
+    def serialQuery(self, command: str) -> str:
         if not self.usb:
             return ""
+
         try:
+            self.usb.reset_input_buffer()
             self.usb.write(command.encode())
-            self.usb.read_until(command.encode() + b'\n')
-            response = self.usb.read_until(b'ch> ')
-            return response[:-6].decode()
-        except serial.SerialException as e:
+
+            # read past echo line quickly (timeout-protected)
+            _ = self.usb.read_until(command.encode() + b"\n")
+
+            # now read response until prompt
+            response = self.usb.read_until(b"ch> ")
+            if not response.endswith(b"ch> "):
+                raise serial.SerialTimeoutException("prompt timeout")
+
+            return response[:-4].decode(errors="replace").rstrip()  # strip 'ch> '
+        except (serial.SerialException, serial.SerialTimeoutException) as e:
             self.signals.error.emit(f"Serial query failed: {e}")
             self.closePort()
             self.ports = []
@@ -328,20 +346,23 @@ class Analyser:
                 pass
             return ""
 
-    def serialWrite(self, command):
+    def serialWrite(self, command: str) -> None:
         if not self.usb:
             return
+
         try:
             self.usb.write(command.encode())
-            self.usb.read_until(b'ch> ')
-        except serial.SerialException as e:
+            response = self.usb.read_until(b"ch> ")
+            if not response.endswith(b"ch> "):
+                raise serial.SerialTimeoutException("prompt timeout")
+        except (serial.SerialException, serial.SerialTimeoutException) as e:
             self.signals.error.emit(f"Serial write failed: {e}")
             self.closePort()
             self.ports = []
             try:
                 usbCheck.start(500)
             except Exception:
-                pass # skip command echo and prompt
+                pass
 
     def set_arrays(self):
         startF = QtTSA.start_freq.value() * 1e6  # freq in Hz
@@ -488,53 +509,60 @@ class Analyser:
                     logging.info('serial port exception')
                     self.sweeping = False
                     break
+            
+            # read one whole sweep (3 bytes per point)
+            raw = self.usb.read(3 * points)
+            if len(raw) != 3 * points:
+                self.signals.error.emit(f"Serial short read ({len(raw)}/{3*points})")
+                self.sweeping = False
+                break
+
+            b = np.frombuffer(raw, dtype=np.uint8).reshape(points, 3)
+
+            # decode little-endian u16 from bytes 1 and 2 (ignore first byte)
+            data = b[:, 1].astype(np.uint16) | (b[:, 2].astype(np.uint16) << 8)
+
+            readings[0, :] = (data.astype(np.float32) / 32.0) - self.scale
 
             # read the measurement data from the tinySA
             for point in range(points):
-                try:
-                    dataBlock = self.usb.read(3)  # read a block of 3 bytes of data
-                except serial.SerialException as e:
-                    self.signals.error.emit(f"Serial read failed: {e}")
-                    self.sweeping = False
-                    break
-
-                # If we didn't get exactly 3 bytes, treat as lost sync / disconnect
-                if not dataBlock or len(dataBlock) != 3:
-                    self.signals.error.emit(f"Serial short read (got {len(dataBlock) if dataBlock else 0} bytes)")
-                    self.sweeping = False
-                    break
-
-                logging.debug(f'dataBlock: {dataBlock}\n')
-                if dataBlock == b'}':  # from FW165 jog button press returns different value
-                    logging.info('screen touched or jog button pressed')
-                    self.sweeping = False
-                    break
-                try:
-                    c, data = struct.unpack('<' + 'cH', dataBlock)
-                except struct.error:
-                    logging.info('data error')
-                    self.sweeping = False
-                    break
-                readings[0, point] = (data / 32) - self.scale  # scale 0..4095 -> -128..-0.03 dBm
-
                 # If it's the final point of this sweep, set up for the next sweep
                 if point == points - 1:
                     readingsMax = np.nanmax(readings[:self.scanMemory], axis=0)
                     readingsMin = np.nanmin(readings[:self.scanMemory], axis=0)
                     maxima = np.fmax(maxima, readingsMax)
                     minima = np.fmin(minima, readingsMin)
-                    readings[-1] = readings[0]  # populate last row with current sweep before rolling
-                    readings = np.roll(readings, 1, axis=0)  # readings row 0 is now full: roll it down 1 row
+
+                    readings[-1] = readings[0]
+                    readings = np.roll(readings, 1, axis=0)
+
                     if version >= 177:
-                        if self.usb.read(2) != b'}{':  # the end of scan marker character is '}{'
-                            logging.info('QtTinySA display is out of sync with tinySA frequency')
+                        try:
+                            tail = self.usb.read(2)   # expect b'}{'
+                        except serial.SerialException as e:
+                            self.signals.error.emit(f"Serial read failed at end-of-sweep: {e}")
                             self.sweeping = False
                             break
+
+                        # Handle timeout/short read explicitly
+                        if not tail or len(tail) != 2:
+                            self.signals.error.emit(
+                                f"Serial short read at end-of-sweep ({len(tail) if tail else 0}/2 bytes) - disconnected?"
+                            )
+                            self.sweeping = False
+                            break
+
+                        if tail != b'}{':
+                            logging.info(f"Out of sync tail={tail!r} (expected b'}}{{')")
+                            self.sweeping = False
+                            break
+
                         sweepCount += 1
                         firstRun = False
-                        if sweepCount == self.scanMemory:  # array is full so trigger CSV data file save
+                        if sweepCount == self.scanMemory:
                             self.signals.saveResults.emit(frequencies, readings)
                             sweepCount = 0
+
                     self.signals.sweepEnds.emit(frequencies)
 
                 # If a sweep setting has been changed by the user, the sweep must be re-started (+ new recording start)
