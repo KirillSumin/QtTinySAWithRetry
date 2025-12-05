@@ -510,10 +510,14 @@ class Analyser:
                     self.sweeping = False
                     break
             
-            # read one whole sweep (3 bytes per point)
-            raw = self.usb.read(3 * points)
-            if len(raw) != 3 * points:
-                self.signals.error.emit(f"Serial short read ({len(raw)}/{3*points})")
+            try:
+                raw = self.usb.read(3 * points)
+                if len(raw) != 3 * points:
+                    self.signals.error.emit(f"Serial short read ({len(raw)}/{3*points})")
+                    self.sweeping = False
+                    break
+            except serial.SerialException:
+                logging.info('serial port exception')
                 self.sweeping = False
                 break
 
